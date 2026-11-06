@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <title>Каталог товаров</title>
+  <style>
+    body { font-family: sans-serif; max-width: 640px; margin: 40px auto; }
+    table { border-collapse: collapse; width: 100%; }
+    th, td { border: 1px solid #ccc; padding: 6px 10px; text-align: left; }
+  </style>
+</head>
+<body>
+  <h1>Каталог товаров</h1>
+  <p>Всего записей: <span id="items-count">{{ items|length }}</span></p>
+  <table>
+    <tr><th>ID</th><th>Название</th><th>Цена</th></tr>
+{%- for item in items %}
+    <tr class="item" data-id="{{ item.id }}"><td>{{ item.id }}</td><td class="name">{{ item.name }}</td><td>{{ "%.2f"|format(item.price) }}</td></tr>
+{%- endfor %}
+  </table>
+</body>
+</html>
