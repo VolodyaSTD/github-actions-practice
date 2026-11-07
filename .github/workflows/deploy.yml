@@ -19,3 +19,59 @@ jobs:
           echo "Папка проекта: $(pwd)"
           docker --version
           docker-compose version
+
+      - name: Создать .env из GitHub Secrets
+        env:
+          DB_HOST: ${{ secrets.DB_HOST }}
+          DB_PORT: ${{ secrets.DB_PORT }}
+          DB_NAME: ${{ secrets.DB_NAME }}
+          DB_USER: ${{ secrets.DB_USER }}
+          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+          APP_PORT: ${{ secrets.APP_PORT }}
+          APP_SECRET: ${{ secrets.APP_SECRET }}
+        run: |
+          echo "DB_HOST=$DB_HOST"         >  .env
+          echo "DB_PORT=$DB_PORT"         >> .env
+          echo "DB_NAME=$DB_NAME"         >> .env
+          echo "DB_USER=$DB_USER"         >> .env
+          echo "DB_PASSWORD=$DB_PASSWORD" >> .env
+          echo "APP_PORT=$APP_PORT"       >> .env
+          echo "APP_SECRET=$APP_SECRET"   >> .env
+          echo ".env создан, в нём переменные:"
+          cut -d= -f1 .env
+
+      - name: Запустить проект через Docker Compose
+        run: |
+          docker-compose up -d --build
+          docker-compose ps
+
+
+      - name: Проверить, что контейнеры запущены
+        run: |
+          sleep 5
+          docker-compose ps
+          RUNNING=$(docker-compose ps --services --filter "status=running" | wc -l)
+          echo "Запущено сервисов: $RUNNING из 2"
+          [ "$RUNNING" -eq 2 ]
+
+      - name: "Тест 1: приложение и подключение к БД"
+        run: bash tests/test_app_db.sh
+
+      - name: "Тест 2: данные в БД совпадают с сайтом"
+        run: bash tests/test_data_consistency.sh
+
+      - name: Собрать логи
+        if: always()
+        run: |
+          mkdir -p artifacts
+          docker-compose ps > artifacts/docker-compose-ps.txt
+          docker-compose logs --no-color > artifacts/docker-compose-logs.txt
+          cut -d= -f1 .env > artifacts/env-variables.txt
+
+      - name: Сохранить артефакты
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: deployment-artifacts-${{ github.run_number }}
+          path: artifacts/
+          retention-days: 30
