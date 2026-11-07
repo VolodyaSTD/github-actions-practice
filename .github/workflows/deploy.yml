@@ -1,0 +1,21 @@
+name: Deploy and Test
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  deploy-and-test:
+    runs-on: self-hosted
+
+    steps:
+      - name: Получить код из репозитория
+        uses: actions/checkout@v7
+
+      - name: Информация о раннере
+        run: |
+          echo "Раннер: $RUNNER_NAME"
+          echo "Папка проекта: $(pwd)"
+          docker --version
+          docker-compose version
