@@ -1,0 +1,55 @@
+# docker-compose.prod.yml
+# Целевой (production) стек: Mattermost 12.0.1 + PostgreSQL 15
+name: mattermost
+
+services:
+  mattermost:
+    image: mattermost/mattermost-team-edition:12.0.1
+    container_name: mattermost
+    ports:
+      - "8065:8065"
+    environment:
+      - TZ=UTC
+      - MM_SQLSETTINGS_DRIVERNAME=postgres
+      - MM_SQLSETTINGS_DATASOURCE=postgres://postgres:${POSTGRES_PASSWORD}@mattermost-postgres:5432/mattermost?sslmode=disable&connect_timeout=10&search_path=mattermost
+      - MM_SERVICESETTINGS_SITEURL=http://localhost:8065
+      - MM_TEAMSETTINGS_ENABLEOPENSERVER=false
+    volumes:
+      # ТЕ ЖЕ тома, что и в legacy: аватары и вложения переезжают без копирования
+      - mattermost_data:/mattermost/data
+      - mattermost_logs:/mattermost/logs
+    networks:
+      - mattermost_network
+    depends_on:
+      db-postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  db-postgres:
+    image: postgres:15-alpine
+    container_name: mattermost-postgres
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_DB=mattermost
+      - TZ=UTC
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d mattermost"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    networks:
+      - mattermost_network
+    restart: unless-stopped
+
+networks:
+  mattermost_network:
+    name: mattermost_network
+    driver: bridge
+
+volumes:
+  mattermost_data:
+  mattermost_logs:
+  postgres_data:
