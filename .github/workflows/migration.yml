@@ -1,0 +1,141 @@
+name: Idempotent Mattermost Migration & Upgrade
+
+on:
+  push:
+    branches: [ "migration" ]
+  workflow_dispatch:
+
+# Два запуска миграции одновременно идти не могут
+concurrency:
+  group: mattermost-migration
+  cancel-in-progress: false
+
+env:
+  COMPOSE_FILE: docker-compose.prod.yml
+
+jobs:
+  migrate-and-deploy:
+    runs-on: self-hosted
+    timeout-minutes: 30
+    env:
+      # Пароли берутся только из GitHub Secrets; в логах GitHub заменяет их на ***
+      MYSQL_ROOT_PASSWORD: ${{ secrets.DB_MYSQL_ROOT_PASSWORD }}
+      POSTGRES_PASSWORD: ${{ secrets.DB_POSTGRES_PASSWORD }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # 1. Проверка идемпотентности: выполнялась ли миграция ранее?
+      - name: Check Migration Status
+        id: check_status
+        run: |
+          FLAG_FILE="$HOME/.mattermost_migration_completed"
+          echo "FLAG_FILE=$FLAG_FILE" >> "$GITHUB_ENV"
+          if [ -f "$FLAG_FILE" ]; then
+            echo "Database already migrated to PostgreSQL ($(cat "$FLAG_FILE")). Skipping data transfer."
+            echo "already_migrated=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "igration required."
+            echo "already_migrated=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # 2. Останавливаем старое приложение, чтобы данные не менялись во время бэкапа и переноса
+      - name: Stop Legacy Mattermost
+        if: steps.check_status.outputs.already_migrated == 'false'
+        run: |
+          docker stop mattermost 2>/dev/null && echo "Legacy Mattermost stopped" || echo "Mattermost is not running"
+
+      # 3. Резервная копия MySQL перед началом работ
+      - name: Backup Legacy MySQL
+        if: steps.check_status.outputs.already_migrated == 'false'
+        run: |
+          if ! docker ps --format '{{.Names}}' | grep -qx mattermost-mysql; then
+            echo "Error: Legacy MySQL container is not running!"
+            exit 1
+          fi
+          BACKUP_DIR="$HOME/mattermost_backups"
+          mkdir -p "$BACKUP_DIR"
+          BACKUP_FILE="$BACKUP_DIR/mattermost_mysql_backup_${{ github.run_id }}.sql"
+          echo "Creating backup of MySQL..."
+          # Пароль передаётся через MYSQL_PWD, а не через -p: его нет в командной строке
+          docker exec -e MYSQL_PWD="$MYSQL_ROOT_PASSWORD" mattermost-mysql
+            mysqldump -uroot --single-transaction --default-character-set=utf8mb4 mattermost > "$BACKUP_FILE"
+          test -s "$BACKUP_FILE"
+          echo "Backup saved: $BACKUP_FILE ($(du -h "$BACKUP_FILE" | cut -f1))"
+
+      # 4. Поднимаем целевой PostgreSQL и ждём, пока он станет healthy
+      - name: Start Target PostgreSQL
+        if: steps.check_status.outputs.already_migrated == 'false'
+        run: |
+          docker compose -f "$COMPOSE_FILE" up -d --wait db-postgres
+          echo "PostgreSQL is ready"
+
+      # 5. Гетерогенная миграция MySQL -> PostgreSQL
+      - name: Run pgloader (With Schema Drop for Idempotency)
+        if: steps.check_status.outputs.already_migrated == 'false'
+        run: |
+          echo "Migrating schema and data from MySQL to PostgreSQL..."
+          # "include drop" удаляет таблицы перед созданием: повторный запуск
+          # после сбоя перезаписывает их, а не дублирует
+          docker run --rm --network mattermost_network
+            mattermost/mattermost-pgloader:latest pgloader
+            --with "include drop"
+            "mysql://root:${MYSQL_ROOT_PASSWORD}@mattermost-mysql/mattermost"
+            "postgresql://postgres:${POSTGRES_PASSWORD}@mattermost-postgres/mattermost"
+
+      # 6. Проверяем, что данные действительно легли в PostgreSQL (до установки флага!)
+      - name: Verify Data Transfer
+        if: steps.check_status.outputs.already_migrated == 'false'
+        run: |
+          docker exec mattermost-postgres psql -U postgres -d mattermost -c '\dn'
+          POSTS=$(docker exec mattermost-postgres psql -U postgres -d mattermost -At -c "SELECT count(*) FROM mattermost.posts")
+          echo "Posts transferred: $POSTS"
+          [ "$POSTS" -gt 0 ]
+
+      # 7. Флаг успешной миграции
+      - name: Mark Migration as Completed
+        if: steps.check_status.outputs.already_migrated == 'false'
+        run: |
+          date -Iseconds > "$FLAG_FILE"
+          echo "Flag file created: $FLAG_FILE"
+
+      # 8. Развёртывание обновлённого стека
+      - name: Deploy Upgraded Stack
+        run: |
+          echo "Launching Upgraded Mattermost Stack..."
+          # --remove-orphans удаляет контейнер mattermost-mysql (его нет в prod-файле)
+          docker compose -f "$COMPOSE_FILE" up -d --remove-orphans --wait --wait-timeout 300
+          docker compose -f "$COMPOSE_FILE" ps
+
+      # 9. Автотесты: доступность, код ответа, отсутствие MySQL, сохранность сообщений
+      - name: Run Health Checks & Verify Data
+        run: |
+          echo "Running Smoke Tests..."
+          OK=false
+          for i in $(seq 1 30); do
+            if curl -fsS http://localhost:8065/api/v4/system/ping; then OK=true; break; fi
+            echo " waiting for Mattermost ($i/30)..."; sleep 5
+          done
+          echo
+          [ "$OK" = true ] || { echo "API ping failed"; exit 1; }
+
+          CODE=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8065/login)
+          echo "HTTP code of /login: $CODE"
+          [ "$CODE" = "200" ] || { echo "Web UI returned $CODE"; exit 1; }
+
+          if docker ps -a --format '{{.Names}}' | grep -qx mattermost-mysql; then
+            echo "Legacy MySQL container still exists"; exit 1
+          fi
+          echo "Legacy MySQL container removed"
+
+          docker exec mattermost-postgres psql -U postgres -d mattermost -c
+            "SELECT c.displayname AS channel, c.type, p.message FROM mattermost.posts p JOIN mattermost.channels c ON c.id = p.channelid WHERE p.message LIKE '%миграци%' ORDER BY p.createat;"
+          COUNT=$(docker exec mattermost-postgres psql -U postgres -d mattermost -At -c
+            "SELECT count(*) FROM mattermost.posts WHERE message LIKE '%миграци%'")
+          [ "$COUNT" -ge 4 ] || { echo "Test messages lost: found $COUNT"; exit 1; }
+          echo "Mattermost 12 is running on PostgreSQL, all $COUNT test messages preserved"
+
+      - name: Show Logs on Failure
+        if: failure()
+        run: docker compose -f "$COMPOSE_FILE" logs --tail 200 --no-color
